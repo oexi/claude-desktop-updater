@@ -22,6 +22,26 @@ defaults:
     shell: bash   # 显式指定才会带 -o pipefail
 
 jobs:
+  keepalive:
+    name: 保活定时任务
+    # 公开仓库 60 天没有提交，GitHub 会停用定时 workflow。对已启用的 workflow
+    # 再调用一次 enable API 会重置这个计时，因此每次运行都调用一次，不需要空提交。
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 重新启用本 workflow（重置 60 天不活跃计时）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}   # owner/repo/.github/workflows/x.yml@ref
+        run: |
+          file=${WORKFLOW_REF%@*}
+          file=${file##*/}
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$file/enable"
+          state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$file" --jq .state)
+          echo "$file: $state"
+          [[ $state == active ]]
+
   check:
     name: 检查上游版本
     runs-on: ubuntu-latest

@@ -12,6 +12,7 @@ Checks every day for new Linux releases of [Claude Desktop](https://code.claude.
 
 ```
 check ──► build (pacman×2, rpm×2, in parallel containers) ──► release
+keepalive (in parallel: keeps the daily schedule from being auto-disabled)
 ```
 
 1. **check**: `scripts/check-upstream.sh` reads Anthropic's official apt repository and verifies the whole chain of trust:
@@ -72,6 +73,6 @@ claude-desktop-update           local updater for Arch
 ## Notes
 
 - **License**: Claude Desktop is proprietary software from Anthropic (`License: Proprietary`). Publishing these packages in a release redistributes its binaries. **Keeping this repository private for personal use is recommended.**
-- In public repositories, GitHub disables scheduled workflows after 60 days without commits (publishing releases does not count as activity). Private repositories are not affected.
+- In public repositories, GitHub disables scheduled workflows after 60 days without commits (publishing releases does not count as activity). To prevent this, the `keepalive` job calls the [enable workflow](https://docs.github.com/en/rest/actions/workflows#enable-a-workflow) API on every run: enabling a workflow that is already enabled resets the 60-day timer, so no dummy commits are needed.
 - Private repositories use Actions minutes: about 1 minute per daily check, about 5–10 minutes for a full build when a new version is out. Build artifacts are kept for 1 day.
 - The `.rpm` and `.pkg.tar.zst` packages are unsigned; verify them with the `SHA256SUMS` file in the release.
