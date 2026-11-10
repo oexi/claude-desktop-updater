@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# claude-desktop-update —— 在 Arch Linux 本机检查、下载并安装最新版 Claude Desktop
+#
+# 直接读取 Anthropic 官方 apt 仓库（签名校验），把官方 .deb 重新打包成 pacman 包
+# （包名 claude-desktop，可直接替换 AUR 版本）后用 pacman 安装。
+# 与 GitHub Actions 使用同一套脚本与打包模板（scripts/、packaging/），
+# 因此本脚本需要放在仓库里运行；可以软链接到 ~/.local/bin。
+#
+# 用法：claude-desktop-update [选项]
+#   （无选项）           检查 → 有新版则下载、打包、安装（pacman 会请求确认）
+#   -c, --check          只检查，不下载。退出码：0 已是最新，10 有更新，1 出错
+#   -b, --build-only     下载并打包，但不安装（打印生成的包路径）
+#   -f, --force          即使已是最新也重新打包安装
+#   -y, --yes            不询问，直接安装（pacman --noconfirm）
+#       --allow-running  Claude Desktop 正在运行时也直接安装
+#                        （默认：交互模式下询问；-y 模式下跳过安装，退出码 3）
+#       --keep           保留旧版本的构建目录（默认安装成功后清理）
+#   -h, --help           显示帮助
+#
+# 环境变量：
+#   CLAUDE_DESKTOP_UPDATE_CACHE  缓存/构建目录（默认 ~/.cache/claude-desktop-update）
+
+set -euo pipefail
+
+SELF_DIR=$(dirname "$(readlink -f "$0")")
+# shellcheck source=scripts/common.sh
+. "$SELF_DIR/scripts/common.sh"
+
+readonly ELECTRON_BIN="/usr/lib/claude-desktop/claude-desktop"
+CACHE_DIR="${CLAUDE_DESKTOP_UPDATE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-update}"
+
+opt_check=0 opt_build_only=0 opt_force=0 opt_yes=0 opt_allow_running=0 opt_keep=0
+
+confirm() { # confirm "问题" —— 默认否；没有终端时视为否
+  local ans=''
+  { exec 8<>/dev/tty; } 2>/dev/null || return 1
+  printf '%s [y/N] ' "$1" >&8
+  read -r -u 8 ans || ans=''
+  exec 8>&-
+  [[ $ans == [yY] || $ans == [yY][eE][sS] ]]
+}
+
+usage() { sed -n '2,/^$/{/^$/d;s/^# \{0,1\}//;p}' "$0"; }
+
+app_running() { pgrep -f "^$ELECTRON_BIN( |\$)" >/dev/null; }
+
+# ================================================================ 参数
+while (($#)); do
+  case $1 in
+    -c|--check) opt_check=1 ;;
+    -b|--build-only) opt_build_only=1 ;;
+    -f|--force) opt_force=1 ;;
+    -y|--yes) opt_yes=1 ;;
+    --allow-running) opt_allow_running=1 ;;
+    --keep) opt_keep=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "未知参数: $1（用 --help 查看用法）" ;;
+  esac
+  shift
+done
+
+# ================================================================ 环境检查
+((EUID != 0)) || die "请用普通用户运行（makepkg 不允许 root；安装时会自动调用 sudo）"
+need pacman makepkg vercmp flock pgrep
+
+carch=$(uname -m)
+deb_arch=$(carch_to_deb "$carch") || die "不支持的架构: $carch（上游只提供 amd64 / arm64）"
+pkgrel=$PKGREL_DEFAULT
+is_pkgrel "$pkgrel" || die "packaging/PKGREL 内容无效: $pkgrel"
+
+mkdir -p "$CACHE_DIR/tmp"
+# 打包时要解出约 600 MiB 文件：放在磁盘缓存目录，而不是可能是 tmpfs 的 /tmp
+export TMPDIR="$CACHE_DIR/tmp"
+exec 9>"$CACHE_DIR/.lock"
+flock -n 9 || die "另一个 claude-desktop-update 正在运行"
+
+# ================================================================ 1. 上游最新版本（签名校验在 check-upstream.sh 里）
+upstream=$("$SELF_DIR/scripts/check-upstream.sh" --arch "$deb_arch") || die "检查上游失败"
+declare -A up=()
+while IFS='=' read -r k v; do
+  [[ -n $k ]] && up[$k]=$v
+done <<<"$upstream"
+
+latest_ver=${up[version]:-}
+deb_url=${up[deb_${deb_arch}_url]:-}
+deb_sha=${up[deb_${deb_arch}_sha256]:-}
+deb_size=${up[deb_${deb_arch}_size]:-0}
+[[ -n $latest_ver && -n $deb_url && -n $deb_sha ]] || die "上游没有 $deb_arch 的 $PKGNAME 包"
+
+# ================================================================ 2. 与已安装版本比较
+installed_full=$(pacman -Q "$PKGNAME" 2>/dev/null | awk '{print $2}') || installed_full=''
+installed_ver=${installed_full%-*}    # 去掉 pkgrel
+installed_ver=${installed_ver#*:}     # 去掉 epoch（如有）
+
+info "已安装: ${installed_full:-（未安装）}"
+info "最新版: $latest_ver（$(( deb_size / 1048576 )) MiB）"
+
+need_update=0
+if [[ -z $installed_ver ]] || (( $(vercmp "$latest_ver" "$installed_ver") > 0 )); then
+  need_update=1
+fi
+
+if ((opt_check)); then
+  if ((need_update)); then
+    msg "有可用更新: ${installed_ver:-未安装} → $latest_ver"
+    exit 10
+  fi
+  msg "已是最新版本"
+  exit 0
+fi
+
+if ((!need_update && !opt_force)); then
+  msg "已是最新版本，无需更新（用 --force 强制重装）"
+  exit 0
+fi
+
+# ================================================================ 3. 下载并打包
+build_dir="$CACHE_DIR/build/$latest_ver"
+pkgfile="$build_dir/$(asset_pacman "$latest_ver" "$pkgrel" "$carch")"
+
+if [[ -f $pkgfile && $opt_force -eq 0 ]]; then
+  info "已存在构建好的包，跳过打包: $pkgfile"
+else
+  deb=$("$SELF_DIR/scripts/fetch-deb.sh" "$deb_url" "$deb_sha" "$build_dir")
+  "$SELF_DIR/scripts/build-pacman.sh" --deb "$deb" --sha256 "$deb_sha" --version "$latest_ver" \
+    --carch "$carch" --pkgrel "$pkgrel" --outdir "$build_dir" >/dev/null
+fi
+[[ -f $pkgfile ]] || die "打包后找不到 $pkgfile"
+msg "包已生成: $pkgfile"
+
+if ((opt_build_only)); then
+  info "手动安装: sudo pacman -U '$pkgfile'"
+  exit 0
+fi
+
+# ================================================================ 4. 安装
+# 正在运行时替换文件，可能让运行中的 Electron 崩溃或行为异常
+if app_running; then
+  if ((opt_allow_running)); then
+    warn "Claude Desktop 正在运行，安装后请重启它"
+  elif ((opt_yes)); then
+    warn "Claude Desktop 正在运行，已跳过安装（加 --allow-running 强制安装）"
+    info "退出 Claude Desktop 后手动安装: sudo pacman -U '$pkgfile'"
+    exit 3
+  else
+    warn "Claude Desktop 正在运行。安装会替换它正在使用的文件，建议先完全退出（包括托盘图标）。"
+    confirm "仍然现在安装？" || {
+      info "已取消。之后可手动安装: sudo pacman -U '$pkgfile'"
+      exit 3
+    }
+  fi
+fi
+
+pacman_flags=(-U)
+((opt_yes)) && pacman_flags+=(--noconfirm)
+
+msg "安装 $PKGNAME $latest_ver-$pkgrel"
+sudo pacman "${pacman_flags[@]}" "$pkgfile" || die "pacman 安装失败"
+
+# 清理旧版本的构建目录（每个约 180 MiB .deb + 打好的包）
+if ((!opt_keep)); then
+  for d in "$CACHE_DIR"/build/*/; do
+    [[ ${d%/} == "$build_dir" ]] || rm -rf -- "${d%/}"
+  done
+fi
+
+msg "完成：$PKGNAME ${installed_full:-（未安装）} → $latest_ver-$pkgrel"
+if app_running; then
+  info "Claude Desktop 仍在运行旧版本，请完全退出后重新打开"
+fi

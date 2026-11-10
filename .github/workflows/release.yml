@@ -1,0 +1,165 @@
+name: Claude Desktop Release
+
+on:
+  schedule:
+    - cron: '17 1 * * *'   # 每天 01:17 UTC（北京时间 09:17）。只在默认分支上生效
+  workflow_dispatch:
+    inputs:
+      force:
+        description: release 已完整时也强制重新构建并覆盖资产
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-desktop-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # 显式指定才会带 -o pipefail
+
+jobs:
+  check:
+    name: 检查上游版本
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.status.outputs.needed }}
+      version: ${{ steps.upstream.outputs.version }}
+      arches: ${{ steps.upstream.outputs.arches }}
+      matrix: ${{ steps.upstream.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 读取并校验官方 apt 仓库
+        id: upstream
+        run: scripts/check-upstream.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: 检查 release 是否已完整
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          ARCHES: ${{ steps.upstream.outputs.arches }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: |
+          # shellcheck disable=SC2086  # FORCE 为空或 --force
+          scripts/release.sh status --version "$VERSION" \
+            --arches "$ARCHES" $FORCE | tee -a "$GITHUB_OUTPUT"
+
+      - name: 摘要
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          ARCHES: ${{ steps.upstream.outputs.arches }}
+          NEEDED: ${{ steps.status.outputs.needed }}
+        run: |
+          {
+            echo "### Claude Desktop $VERSION"
+            echo "- 架构：$ARCHES"
+            if [[ $NEEDED == true ]]; then echo "- 需要构建并发布 \`v$VERSION\`"; else echo "- \`v$VERSION\` 已发布且完整，跳过"; fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 打包 ${{ matrix.format }} (${{ matrix.arch.carch }})
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      matrix:
+        format: [pacman, rpm]
+        arch: ${{ fromJSON(needs.check.outputs.matrix) }}
+        include:
+          - format: pacman
+            image: archlinux:base-devel
+          - format: rpm
+            image: fedora:latest
+    steps:
+      - name: 准备容器
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: |
+          case $FORMAT in
+            pacman)
+              # 先更新 keyring：镜像里的 keyring 可能过旧，导致签名校验失败
+              pacman -Sy --noconfirm --needed archlinux-keyring
+              pacman -Su --noconfirm --needed git
+              useradd -m builder        # makepkg 不能以 root 运行
+              ;;
+            rpm)
+              dnf install -y rpm-build binutils tar xz zstd findutils git
+              ;;
+          esac
+
+      - uses: actions/checkout@v7
+
+      - name: 下载官方 .deb 并校验
+        id: deb
+        env:
+          URL: ${{ matrix.arch.url }}
+          SHA256: ${{ matrix.arch.sha256 }}
+        run: echo "path=$(scripts/fetch-deb.sh "$URL" "$SHA256" dl)" >>"$GITHUB_OUTPUT"
+
+      - name: 打包
+        env:
+          FORMAT: ${{ matrix.format }}
+          DEB: ${{ steps.deb.outputs.path }}
+          SHA256: ${{ matrix.arch.sha256 }}
+          VERSION: ${{ needs.check.outputs.version }}
+          CARCH: ${{ matrix.arch.carch }}
+        run: |
+          args=(--deb "$DEB" --sha256 "$SHA256" --version "$VERSION" --carch "$CARCH" --outdir dist)
+          case $FORMAT in
+            pacman)
+              chown -R builder: "$GITHUB_WORKSPACE"
+              runuser -u builder -- scripts/build-pacman.sh "${args[@]}"
+              ;;
+            rpm)
+              scripts/build-rpm.sh "${args[@]}"
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.format }}-${{ matrix.arch.carch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0   # 包本身已压缩
+
+  release:
+    name: 发布 release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: 下载官方 .deb（原样发布）
+        env:
+          MATRIX: ${{ needs.check.outputs.matrix }}
+        run: |
+          jq -r '.[] | "\(.url) \(.sha256)"' <<<"$MATRIX" | while read -r url sha; do
+            scripts/fetch-deb.sh "$url" "$sha" dist >/dev/null
+          done
+
+      - name: 创建或更新 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCHES: ${{ needs.check.outputs.arches }}
+        run: |
+          scripts/release.sh publish --version "$VERSION" \
+            --arches "$ARCHES" --dist dist --target "$GITHUB_SHA"
+          ls -la dist
